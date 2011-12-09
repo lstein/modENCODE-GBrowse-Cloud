@@ -1,0 +1,98 @@
+1. On the target AWS machine that is going to be running GBrowse create appropriate volume for
+raw data. I used an LVM volume composed of two EBS volumes in RAID0 configuration. Testing
+shows this to give very good performance relative to a single EBS volume.
+
+   apt-get install mdadm
+   apt-get install lvm2
+   apt-get install xfsprogs
+
+   # use AWS console to create two disks of equal size -- I made two 500 G disks for a combined
+   # 1 TB volume
+   mdadm --create --verbose /dev/md0 --level=0 -c256 --raid-devices=2 /dev/sdg1 /dev/sdg2
+   mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf
+   pvcreate /dev/md0
+   vgcreate vg0 /dev/md0
+   lvcreate -L 999G -n lv0 vg0  # can't quite make it to 1TB using default 4M PE!
+   blockdev --setra 65536 /dev/vg0/lv0
+   mkfs.xfs /dev/vg0/lv0
+   mkdir /modencode/browser_data
+   mount -o noatime /dev/vg0/lv0 /modencode/browser_data/
+   chown ubuntu /modencode/browser_data/
+
+   # Create a logical volume for mysql following a similar paradigm. In this case, two 35 G
+   # disks will provide sufficient space
+   mdadm --create --verbose /dev/md1 --level=0 -c256 --raid-devices=2 /dev/sdh1 /dev/sdh2
+   mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf
+   pvcreate /dev/md1
+   vgextend vg0 /dev/md1
+   lvcreate -L 65G -n lv1 vg0  # we will end up with a few unused G that we can use to extend vols later
+   blockdev --setra 65536 /dev/vg0/lv0
+   mkfs.xfs /dev/vg0/lv1
+   mkdir /modencode/browser_data/mysql
+   mount -o noatime /dev/vg0/lv1 /modencode/browser_data/mysql
+   chown mysql.mysql /modencode/browser_data/mysql
+
+2. On modencode.oicr.on.ca create a staging directory for what will be copied to AWS.
+This can be done with a pipe of the following programs:
+
+  dump_databases.pl  # if needed to refresh sql dumps
+
+  extract_gbrowse_binary_filenames.pl | clean_and_tally.pl | create_link_dir.pl
+
+Standard error will contain a list of the volume sizes needed.
+
+3. rsync to the destination machine. This is somewhat complicated because 
+modencode can't ssh out (don't know why).
+
+Need to do following:
+
+  1. Create an ssh keypair on a machine that has internet access, I used xfer.res
+  2. Append public key to AWS machine at .ssh/authorized_keys
+  3. Copy private key to modencode.oicr.on.ca
+  4. From xfer.res, create an ssh tunnel between modencode and AWS machine:
+              ssh -R12345:xx-xx-xx-xx.compute-ec2.amazon.com:22 modencode.oicr.on.ca sleep 1000
+     (replace xx-xx-xx-xx with the appropriate DNS name of the AWS instance).
+  5. From modencode, run following bizarro command:
+       rsync -Ravz --copy-links -e'ssh -o "StrictHostKeyChecking no" -iMyPrivateKey -p12345 -lubuntu' ./browser_data localhost:/modencode/
+
+It is a good idea to run the rsync in a "screen" session to avoid accidental hangups.
+
+THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
+
+4. Move the conf files into place
+   
+   cd /modencode/browser_data/conf
+   tar cf - * | (cd /etc/gbrowse2; sudo tar xvf -)
+   cd /etc/gbrowse2
+   find . -name '*gz' -exec sudo gunzip -f {} \;
+
+4. Make sure that the gbrowse user_accounts database is initialized:
+
+   sudo mkdir /var/www/conf/user_accounts
+   sudo chown www-data /var/www/conf/user_accounts/
+   gbrowse_metadb_config.pl 
+
+
+4. Initiate mysql databases if needed
+    
+   umount /var/lib/mysql  # if needed
+   mount /modencode/browser_data/mysql /var/lib/mysql -o bind,rw
+   mysql_install_db
+   mysqladmin -u root password 'modencode'
+   mysql -e 'grant select on *.* to nobody@localhost'
+
+
+
+5. Load the databases into mysql:
+
+ #!/usr/bin/perl                                                                                                                                                                       
+ use strict;
+ my @dumps = glob('/modencode/browser_data/mysql_dumps/*gz');
+ for my $d (@dumps) {
+    my ($dbname) = $d =~ m!([^/]+)\.sql\.gz$!;
+    $dbname or die "Can't find dbname from $d";
+    system "mysqladmin -uroot -pmodencode create $dbname";
+    system "zcat $d | mysql -uroot -pmodencode $dbname";
+ }
+
+
