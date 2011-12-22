@@ -1,6 +1,17 @@
-1. On the target AWS machine that is going to be running GBrowse create appropriate volume for
-raw data. I used an LVM volume composed of two EBS volumes in RAID0 configuration. Testing
-shows this to give very good performance relative to a single EBS volume.
+Introduction:
+
+The principle here is to maximize the performance and flexibility of
+the EC2 EBS volumes by combining two EBS volumes into a RAID0
+configuration (effectively doubling performance), and then combining
+several of these RAID pairs into a logical volume (LVM) that can be
+resized at create time. XFS file systems sit on top of the logical
+volumes because of XFS's ability to resize while mounted as well as
+good performance characteristics.
+
+1. On the target AWS machine that is going to be running GBrowse
+create appropriate volume for raw data. I used an LVM volume composed
+of two EBS volumes in RAID0 configuration. Testing shows this to give
+very good performance relative to a single EBS volume.
 
    apt-get install mdadm
    apt-get install lvm2
@@ -32,17 +43,20 @@ shows this to give very good performance relative to a single EBS volume.
    mount -o noatime /dev/vg0/lv1 /modencode/browser_data/mysql
    chown mysql.mysql /modencode/browser_data/mysql
 
-2. On modencode.oicr.on.ca create a staging directory for what will be copied to AWS.
-This can be done with a pipe of the following programs:
+2. On modencode.oicr.on.ca create a staging directory for what will be
+copied to AWS.  This can be done with a pipe of the following
+programs:
 
   dump_databases.pl  # if needed to refresh sql dumps
 
-  extract_gbrowse_binary_filenames.pl | clean_and_tally.pl | create_link_dir.pl
+  extract_gbrowse_binary_filenames.pl | clean_and_tally.pl | create_link_dir.pl 2>&1 | tee file_sizes.txt
 
-Standard error will contain a list of the volume sizes needed.
+Standard error (and file_sizes.txt) will contain a list of the volume sizes needed.
 
-3. rsync to the destination machine. This is somewhat complicated because 
-modencode can't ssh out (don't know why).
+These scripts can be found on github at https://github.com/lstein/modENCODE-GBrowse-Cloud.
+
+3. rsync to the destination machine. This is somewhat complicated
+because modencode can't ssh out (don't know why).
 
 Need to do following:
 
@@ -50,10 +64,11 @@ Need to do following:
   2. Append public key to AWS machine at .ssh/authorized_keys
   3. Copy private key to modencode.oicr.on.ca
   4. From xfer.res, create an ssh tunnel between modencode and AWS machine:
-              ssh -R12345:xx-xx-xx-xx.compute-ec2.amazon.com:22 modencode.oicr.on.ca sleep 1000
+              ssh -R12345:xx-xx-xx-xx.compute-ec2.amazon.com:22 modencode.oicr.on.ca sleep 1000 &
      (replace xx-xx-xx-xx with the appropriate DNS name of the AWS instance).
   5. From modencode, run following bizarro command:
        rsync -Ravz --copy-links -e'ssh -o "StrictHostKeyChecking no" -iMyPrivateKey -p12345 -lubuntu' ./browser_data localhost:/modencode/
+       This command is found in the shell script transfer.sh.
 
 It is a good idea to run the rsync in a "screen" session to avoid accidental hangups.
 
@@ -73,7 +88,7 @@ THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
    gbrowse_metadb_config.pl 
 
 
-4. Initiate mysql databases if needed
+5. Initiate mysql databases if needed
     
    umount /var/lib/mysql  # if needed
    mount /modencode/browser_data/mysql /var/lib/mysql -o bind,rw
@@ -81,9 +96,7 @@ THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
    mysqladmin -u root password 'modencode'
    mysql -e 'grant select on *.* to nobody@localhost'
 
-
-
-5. Load the databases into mysql:
+6. Load the databases into mysql:
 
  #!/usr/bin/perl                                                                                                                                                                       
  use strict;
@@ -94,5 +107,86 @@ THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
     system "mysqladmin -uroot -pmodencode create $dbname";
     system "zcat $d | mysql -uroot -pmodencode $dbname";
  }
+
+= UPDATING =
+
+1. After performing step (2), determine whether the size of the existing
+volumes is sufficient for the additional data.
+
+2. If the size is insufficient, then you will need to increase the size of the
+volume. For best performance, you should create a new RAID volume, and add it to the
+volume group. To avoid a proliferation of RAIDs, make the new volume large enough so
+that you can remove one of the older RAIDs.
+
+  # euca-create-volume --size 200 --zone us-east-1c
+  VOLUME	vol-47325b2a	200	creating	2011-12-21T19:55:41.000Z
+  # euca-create-volume --size 200 --zone us-east-1c
+  VOLUME	vol-31325b5c	200	creating	2011-12-21T19:55:59.000Z
+
+  # euca-attach-volume --instance i-7a41761a --device /dev/sdj1 vol-47325b2a
+  # euca-attach-volume --instance i-7a41761a --device /dev/sdj2 vol-31325b5c
+
+  # mdadm --create --verbose /dev/md3 --level=0 -c256 --raid-devices=2 /dev/sdj1 /dev/sdj2
+  mdadm: array /dev/md3 started.
+
+  # mdadm --detail --scan | sed s/=00/=0/ 
+  (copy /dev/md3 output information into /etc/mdadm/mdadm.conf)
+
+  # pvcreate /dev/md3
+  Physical volume "/dev/md3" successfully created
+
+  # vgextend vg0 /dev/md3
+  Volume group "vg0" successfully extended
+
+  ## OPTIONAL: remove RAIDs that are no longer needed
+  ## TURN OFF APACHE AND MYSQL SERVICES AND UNMOUNT FILE SYSTEMS!
+  # /etc/init.d/apache2 stop; /etc/init.d/mysql stop
+  # umount /modencode/browser_data
+  # umount /modencode/mysql
+  # pvmove /dev/md1
+  # vgreduce vg0 /dev/md1
+  # mdadm --stop /dev/md1
+  # pvmove /dev/md2
+  # vgreduce vg0 /dev/md2
+  # mdadm --stop /dev/md2
+
+Now edit /etc/mdadm/mdadm.conf to comment out /dev/md1 and
+/dev/md2.
+Don't forget to detach and remove the EBS volumes!
+
+Extend the logical volume(s) as needed:
+
+  # lvextend -L 1.2T /dev/vg0/lv0
+  Rounding up size to full physical extent 1.20 TiB
+  Extending logical volume lv0 to 1.20 TiB
+  Logical volume lv0 successfully resized
+
+Remount the volumes
+  
+  # mount /dev/vg0/lv0
+  # mount /dev/vg0/lv1
+  # mount /var/lib/mysql
+
+And extend the XFS volume on top of it
+ 
+  # xfs_growfs /modencode/browser_data/
+  meta-data=/dev/mapper/vg0-lv0    isize=256    agcount=4,
+  agsize=65470464 blks
+           =                       sectsz=512   attr=2
+  data     =                       bsize=4096   blocks=261881856,
+  imaxpct=25
+           =                       sunit=0      swidth=0 blks
+  naming   =version 2              bsize=4096   ascii-ci=0
+  log      =internal               bsize=4096   blocks=127872, version=2
+           =                       sectsz=512   sunit=0 blks,
+  lazy-count=1
+  realtime =none                   extsz=4096   blocks=0, rtextents=0
+  data blocks changed from 261881856 to 322122752
+
+
+  
+
+
+  
 
 
