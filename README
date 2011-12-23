@@ -48,9 +48,10 @@ copied to AWS.  This can be done with a pipe of the following
 programs:
 
   dump_databases.pl  # if needed to refresh sql dumps
+  extract_gbrowse_binary_filenames.pl | clean_and_tally.pl |\
+     create_link_dir.pl 2>&1 | tee file_sizes.txt
 
-  extract_gbrowse_binary_filenames.pl | clean_and_tally.pl | create_link_dir.pl 2>&1 | tee file_sizes.txt
-
+Note that dump_databases.pl writes dumps into the directory /modencode/browser_data/mysql_dumps_new.
 Standard error (and file_sizes.txt) will contain a list of the volume sizes needed.
 
 These scripts can be found on github at https://github.com/lstein/modENCODE-GBrowse-Cloud.
@@ -98,15 +99,7 @@ THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
 
 6. Load the databases into mysql:
 
- #!/usr/bin/perl                                                                                                                                                                       
- use strict;
- my @dumps = glob('/modencode/browser_data/mysql_dumps/*gz');
- for my $d (@dumps) {
-    my ($dbname) = $d =~ m!([^/]+)\.sql\.gz$!;
-    $dbname or die "Can't find dbname from $d";
-    system "mysqladmin -uroot -pmodencode create $dbname";
-    system "zcat $d | mysql -uroot -pmodencode $dbname";
- }
+  load_mysql.pl  # found in the GIT repository
 
 = UPDATING =
 
