@@ -1,115 +1,341 @@
-Introduction:
+INTRODUCTION:
 
-The principle here is to maximize the performance and flexibility of
-the EC2 EBS volumes by combining two EBS volumes into a RAID0
-configuration (effectively doubling performance), and then combining
-several of these RAID pairs into a logical volume (LVM) that can be
-resized at create time. XFS file systems sit on top of the logical
-volumes because of XFS's ability to resize while mounted as well as
-good performance characteristics.
+This describes how to create and maintain the ModENCODE GBrowse public
+EC2 image. Most of this is vanilla; the only complexity arises in the
+management of the disk images. The document is divided into several
+parts: 
 
-1. On the target AWS machine that is going to be running GBrowse
-create appropriate volume for raw data. I used an LVM volume composed
-of two EBS volumes in RAID0 configuration. Testing shows this to give
-very good performance relative to a single EBS volume.
+1. Initialization of the Virtual Machine
+2. Installation of GBrowse
+3. Data marshalling and synchronization
+4. Data loading
+5. Increasing volume sizes
+6. Removing unneeded EBS volumes
+
+1) Initialization of the Virtual Machine
+
+These instructions are pretty generic. The only subtlety is the use of
+logical volumes and RAID to overcome Amazon's 1 TB EBS volume
+limitation and to improve performance. We first use RAID0 to combine
+two EBS volumes into a single disk array, thereby increasing disk
+throughput and decreasing latency. We then build logical volumes on
+top of one or more RAIDs using the logical volume manager. This gives
+us the flexibility to increase volume size as the modENCODE dataset
+grows. Finally, we build XFS filesystems on top of the logical volumes
+because of XFS's ability to resize while mounted as well as good
+performance characteristics.
+
+------------------------------------------------------------------------
+
+1. Create the virtual machine
+
+Find a recent version of Ubuntu's 64-bit AMI. I used the Maverick
+10.10 amd64 server image (ami-cef405a7). Launch it as a "m1.large"
+machine (you can get better performance with m1.xlarge, but large is
+pretty good. Make sure to assign a security group that has both the
+SSH and HTTP ports open!
+
+------------------------------------------------------------------------
+
+2. Install the requisite disk software
+
+You need MDADM, LVM2, and XFS packages installed.
 
    apt-get install mdadm
    apt-get install lvm2
    apt-get install xfsprogs
 
-   # use AWS console to create two disks of equal size -- I made two 500 G disks for a combined
-   # 1 TB volume
+It also helps to have euca2ools running, to give command-line access
+to EC2:
+
+  apt-get install euca2ools
+
+For convenience, create a .eucarc file containing the environment
+variables EC2_ACCESS_KEY, EC2_SECRET_KEY and EC2_URL (very important!).
+
+------------------------------------------------------------------------
+
+3. Create the first set of volumes.
+
+For testing purposes, I initially created two RAIDs and then combined
+them together into a single logical volume group. You do not need to
+do it this way:
+
+ zone=`curl http://169.254.169.254/latest/meta-data/placement/availability-zone`
+
+ (please be sure to choose the zone in which the current
+instance is residing!):
+
+  # euca-create-volume --size 500 --zone $zone
+  VOLUME	vol-47325b2a	500	creating	2011-12-21T19:55:41.000Z
+  # euca-create-volume --size 500 --zone $zone
+  VOLUME	vol-31325b5c	500	creating	2011-12-21T19:55:59.000Z
+
+After the volumes have settled, attach them to the current instance:
+
+ instance=`curl http://169.254.169.254/latest/meta-data/instance-id`
+ euca-attach-volume -i $instance -d /dev/sdg1 vol-47325b2a 
+ euca-attach-volume -i $instance -d /dev/sdg2 vol-31325b5c
+
+Wait for attachments to complete, then create the first RAID
+
    mdadm --create --verbose /dev/md0 --level=0 -c256 --raid-devices=2 /dev/sdg1 /dev/sdg2
    mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf
+
+If all goes well, there will be a new block device called
+/dev/md0. The last step, which adds the information on the
+newly-created RAID to mdadm.conf, is not strictly needed, but helps
+document the configuration in case things get messed up at some time
+in the future.
+
+Create a new volume group containing it:
+
    pvcreate /dev/md0
    vgcreate vg0 /dev/md0
-   lvcreate -L 999G -n lv0 vg0  # can't quite make it to 1TB using default 4M PE!
-   blockdev --setra 65536 /dev/vg0/lv0
-   mkfs.xfs /dev/vg0/lv0
-   mkdir /modencode/browser_data
-   mount -o noatime /dev/vg0/lv0 /modencode/browser_data/
-   chown ubuntu /modencode/browser_data/
 
-   # Create a logical volume for mysql following a similar paradigm. In this case, two 35 G
-   # disks will provide sufficient space
-   mdadm --create --verbose /dev/md1 --level=0 -c256 --raid-devices=2 /dev/sdh1 /dev/sdh2
-   mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf
-   pvcreate /dev/md1
-   vgextend vg0 /dev/md1
-   lvcreate -L 65G -n lv1 vg0  # we will end up with a few unused G that we can use to extend vols later
-   blockdev --setra 65536 /dev/vg0/lv0
-   mkfs.xfs /dev/vg0/lv1
-   mkdir /modencode/browser_data/mysql
-   mount -o noatime /dev/vg0/lv1 /modencode/browser_data/mysql
-   chown mysql.mysql /modencode/browser_data/mysql
+This will create a volume group named "vg0".
 
-2. On modencode.oicr.on.ca create a staging directory for what will be
-copied to AWS.  This can be done with a pipe of the following
-programs:
+To add additional space to the volume group you can repeat with
+another RAID:
 
-  dump_databases.pl  # if needed to refresh sql dumps
+  # euca-create-volume --size 500 --zone $zone
+  VOLUME	vol-98329f22	500	creating	2011-12-21T19:55:41.000Z
+  # euca-create-volume --size 500 --zone $zone
+  VOLUME	vol-22c92898	500	creating	2011-12-21T19:55:59.000Z
+  euca-attach-volume -i $instance -d /dev/sdh1 vol-98329f22
+  euca-attach-volume -i $instance -d /dev/sdh2 vol-31325b5c
+  mdadm --create --verbose /dev/md1 --level=0 -c256 --raid-devices=2 /dev/sdh1 /dev/sdh2
+  mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf
+  pvcreate /dev/md1
+  vgextend vg0 /dev/md1
+
+After this step, volume group vg0 has 2 TB in capacity, contributed in
+equal parts by the RAID volumes /dev/md0 and /dev/md1
+
+Now we can create as many logical volumes as needed. I created two,
+one for the browser flat files, and one for the mysql databases.
+
+ lvcreate -L 1T -n lv0 vg0
+ blockdev --setra 65536 /dev/vg0/lv0
+ mkfs.xfs /dev/vg0/lv0
+ mkdir /modencode/browser_data
+ mount -o noatime /dev/vg0/lv0 /modencode/browser_data/
+ chown ubuntu /modencode/browser_data/
+
+ lvcreate -L 65G -n lv1 vg0
+ blockdev --setra 65536 /dev/vg0/lv1
+ mkfs.xfs /dev/vg0/lv1
+ mkdir /modencode/browser_data/mysql
+ mount -o noatime /dev/vg0/lv1 /modencode/browser_data/mysql
+ chown mysql.mysql /modencode/browser_data/mysql
+
+Note that we've got a log of unused disk capacity in vg0 (we can
+display it using the vgdisplay command). We can grow the logical
+volumes and their XFS filesystems at any point in the future.
+
+We're going to relocate the mysql databases from the image root onto
+/modencode/browser_data/mysql using a mount trick:
+
+   sudo /etc/init.d/mysql stop
+   sudo rm -rf /var/lib/mysql/*   # you saw this right!
+   mount /modencode/browser_data/mysql /var/lib/mysql -o bind,rw
+   mysql_install_db
+   sudo /etc/init.d/mysql start
+   mysqladmin -u root password 'modencode'
+   mysql -e 'grant select on *.* to nobody@localhost'
+
+Last, but not least, record the filesystems into /etc/fstab:
+
+ /dev/vg0/lv0               /modencode/browser_data          xfs     noatime   0   2
+ /dev/vg0/lv1               /modencode/mysql                 xfs     noatime   0   2
+ /modencode/mysql           /var/lib/mysql                   none    rw,bind   0   0
+
+Optionally, change the readahead buffer at boot time for the two
+logical volumes. This modestly increases database performance:
+
+ /etc/rc.local:
+ # tune the logical volumes for better read performance
+ blockdev --setra 65536 /dev/vg0/lv0
+ blockdev --setra 65536 /dev/vg0/lv1
+
+------------------------------------------------------------------------
+
+3. Install GBrowse
+
+This has gotten much easier recently:
+
+ apt-get install gbrowse
+
+The version installed in Ubuntu 10.10 is 2.39. If you wish to get the
+bleeding edge version (which has performance and feature
+improvements), follow the directions at
+http://gmod.org/wiki/GBrowse_2.0_HOWTO.
+
+You may wish to make sure that the gbrowse user_accounts database is
+initialized to allow for logins. This is probably not needed, but won't hurt:
+
+   sudo mkdir /var/www/conf/user_accounts
+   sudo chown www-data /var/www/conf/user_accounts/
+   gbrowse_metadb_config.pl 
+
+------------------------------------------------------------------------
+
+4. Data marshalling and synchronization
+
+These steps need to be performed on modencode.oicr.on.ca. The trick is
+to mirror the browser datasets onto the virtual machine in an
+efficient manner.
+
+On modencode.oicr.on.ca create a staging directory for what will be
+copied to AWS. Using the scripts at
+https://github.com/lstein/modENCODE-GBrowse-Cloud, run the following
+command:
+
+  dump_databases.pl
+
+This writes SQL database dumps into the directory
+/browser_data/mysql_dumps_new. Note that it does not update
+/browser_data/mysql_dumps, which is created automatically by a cron
+job, and doesn't capture all the databases needed for the mirror.
+
+The next step figures out what data files are needed for the mirror
+and creates a directory of links in preparation for an rsync:
+
   extract_gbrowse_binary_filenames.pl | clean_and_tally.pl |\
      create_link_dir.pl 2>&1 | tee file_sizes.txt
 
-Note that dump_databases.pl writes dumps into the directory /modencode/browser_data/mysql_dumps_new.
-Standard error (and file_sizes.txt) will contain a list of the volume sizes needed.
+After this step, standard error (and file_sizes.txt) will contain a
+list of the volume sizes needed, and a directory named "browser_data"
+in the current directory contains a series of symbolic links to the
+files that need to be transferred to the AWS instance. Confirm that
+there is enough sufficient disk capacity on the AWS instance, and if
+necessary, grow the file systems using the recipe in "Increasing
+volume sizes".
 
-These scripts can be found on github at https://github.com/lstein/modENCODE-GBrowse-Cloud.
+The next part is pretty annoying because the modencode machine doesn't
+have outgoing ssh access, and we have to tunnel it. First find an OICR
+machine that has outgoing SSH access. I used xfer.res.oicr.on.ca for
+this purpose. 
 
-3. rsync to the destination machine. This is somewhat complicated
-because modencode can't ssh out (don't know why).
+Now create a new ssh keypair on this machine:
 
-Need to do following:
+     ssh-keygen -f MyPrivateKey
 
-  1. Create an ssh keypair on a machine that has internet access, I used xfer.res
-  2. Append public key to AWS machine at .ssh/authorized_keys
-  3. Copy private key to modencode.oicr.on.ca
-  4. From xfer.res, create an ssh tunnel between modencode and AWS machine:
-              ssh -R12345:xx-xx-xx-xx.compute-ec2.amazon.com:22 modencode.oicr.on.ca sleep 1000 &
-     (replace xx-xx-xx-xx with the appropriate DNS name of the AWS instance).
-  5. From modencode, run following bizarro command:
-       rsync -Ravz --copy-links -e'ssh -o "StrictHostKeyChecking no" -iMyPrivateKey -p12345 -lubuntu' ./browser_data localhost:/modencode/
-       This command is found in the shell script transfer.sh.
+This will generate the private key "MyPrivateKey" and the public key
+"MyPrivateKey.pub".
 
-It is a good idea to run the rsync in a "screen" session to avoid accidental hangups.
+Now append the contents of MyPrivateKey.pub to the AWS instance's
+.ssh/authorized_keys file. I think I did a cut-and-paste between
+terminals!
 
-THE REMAINDER OF THE STEPS ARE ON THE AWS INSTANCE
+Copy the private key to modencode.oicr.on.ca, since this machine does
+not share its home directory.
 
-4. Move the conf files into place
+Now, on the xfer machine, set up the tunnel:
+
+ ssh -f -R12345:xx-xx-xx-xx.compute-ec2.amazon.com:22 modencode.oicr.on.ca sleep 1000
+
+You will need to replace the xx-xx-xx-xx part with the correct DNS name
+for the AWS instance.
+
+Log into modencode.oicr.on.ca, change into the directory that contains
+the "browser_data", and run the following bizarro command:
+
+    rsync -Ravz --copy-links -e'ssh -o "StrictHostKeyChecking no" \
+    -iMyPrivateKey -p12345 -lubuntu' ./browser_data localhost:/modencode/
+
+If you do not wish to type it out, this command is found in the shell
+script transfer.sh in the git distribution.
+
+It is a good idea to run the rsync in a "screen" session to avoid
+accidental hangups. Depending on how much incremental data there is to
+transfer, this may run for several days. We see about 10 GB/hour (20
+mb/s).
+
+------------------------------------------------------------------------
+
+4. Data loading
+
+Once the data is transferred to the AWS instance, you will load the
+databases, configuration files and reload mysql. All these steps occur
+on the AWS instance:
+
+First move the configuration files into place.
    
    cd /modencode/browser_data/conf
    tar cf - * | (cd /etc/gbrowse2; sudo tar xvf -)
    cd /etc/gbrowse2
    find . -name '*gz' -exec sudo gunzip -f {} \;
 
-4. Make sure that the gbrowse user_accounts database is initialized:
-
-   sudo mkdir /var/www/conf/user_accounts
-   sudo chown www-data /var/www/conf/user_accounts/
-   gbrowse_metadb_config.pl 
-
-
-5. Initiate mysql databases if needed
-    
-   umount /var/lib/mysql  # if needed
-   mount /modencode/browser_data/mysql /var/lib/mysql -o bind,rw
-   mysql_install_db
-   mysqladmin -u root password 'modencode'
-   mysql -e 'grant select on *.* to nobody@localhost'
-
-6. Load the databases into mysql:
+Second, load the MYSQL databases:
 
   load_mysql.pl  # found in the GIT repository
 
-= UPDATING =
+Third, restart the web server:
 
-1. After performing step (2), determine whether the size of the existing
-volumes is sufficient for the additional data.
+  sudo /etc/init.d/apache2 restart
 
-2. If the size is insufficient, then you will need to increase the size of the
-volume. For best performance, you should create a new RAID volume, and add it to the
-volume group. To avoid a proliferation of RAIDs, make the new volume large enough so
-that you can remove one of the older RAIDs.
+------------------------------------------------------------------------
+
+5. Increasing volume sizes
+
+If you need to increase the size of one of the data volumes, it is
+relatively easy to do.
+
+First, you may wish to snapshot the current instance. This will make
+it easier to restore the system if you make a mistake.
+
+Unmount the volume that you will be resizing, and stop services
+that depend on it. I prefer to stop everything:
+
+  # /etc/init.d/mysql stop   
+  # /etc/init.d/apache2 stop
+  # umount /dev/vg0/lv1
+  # umount /dev/vg0/lv0
+
+Determine whether you already have sufficient unused capacity in the
+volume group:
+
+  # vgdisplay vg0
+  --- Volume group ---
+  VG Name               vg0
+  System ID
+  Format                lvm2
+  Metadata Areas        2
+  Metadata Sequence No  28
+  VG Access             read/write
+  VG Status             resizable
+  MAX LV                0
+  Cur LV                2
+  Open LV               2
+  Max PV                0
+  Cur PV                2
+  Act PV                2
+  VG Size               1.37 TiB
+  PE Size               4.00 MiB
+  Total PE              358398
+  Alloc PE / Size       341453 / 1.30 TiB
+  Free  PE / Size       16945 / 66.19 GiB
+  VG UUID               jIxAi6-0tfc-drJX-6AXY-lpnE-0amE-ohHLkT
+
+The relevant line of output is "Free PE / Size". In this example, we
+have 66 GB free. If this is sufficient, we can simply allocate some of
+it to the appropriate logical volume. This example adds 20G extra to
+logical volume lv0. You can also specify an absolute size to grow the
+volume to.
+
+ # lvextend -L +20G /dev/vg0/lv0
+
+Then tell XFS to grow the filesystem to fit the capacity of the
+volume:
+
+ # mount /dev/vg0/lv0 /modencode/browser_data
+ # xfs_growfs /modencode/browser_data
+
+If you do not have sufficient capacity in the volume group, then you
+will need to create and add a new EBS volume to it. Although not
+necessary, I recommend you do the RAID striping trick again in order
+to get better I/O performance:
 
   # euca-create-volume --size 200 --zone us-east-1c
   VOLUME	vol-47325b2a	200	creating	2011-12-21T19:55:41.000Z
@@ -119,67 +345,58 @@ that you can remove one of the older RAIDs.
   # euca-attach-volume --instance i-7a41761a --device /dev/sdj1 vol-47325b2a
   # euca-attach-volume --instance i-7a41761a --device /dev/sdj2 vol-31325b5c
 
-  # mdadm --create --verbose /dev/md3 --level=0 -c256 --raid-devices=2 /dev/sdj1 /dev/sdj2
-  mdadm: array /dev/md3 started.
+  # mdadm --create --verbose /dev/md2 --level=0 -c256 --raid-devices=2 /dev/sdj1 /dev/sdj2
+  mdadm: array /dev/md2 started.
 
-  # mdadm --detail --scan | sed s/=00/=0/ 
-  (copy /dev/md3 output information into /etc/mdadm/mdadm.conf)
+  # mdadm --detail --scan | sed s/=00/=0/ >> /etc/mdadm/mdadm.conf)
 
-  # pvcreate /dev/md3
-  Physical volume "/dev/md3" successfully created
+  # pvcreate /dev/md2
+  Physical volume "/dev/md2" successfully created
 
-  # vgextend vg0 /dev/md3
+  # vgextend vg0 /dev/md2
   Volume group "vg0" successfully extended
 
-  ## OPTIONAL: remove RAIDs that are no longer needed
-  ## TURN OFF APACHE AND MYSQL SERVICES AND UNMOUNT FILE SYSTEMS!
+  # lvextend -L +400G /dev/vg0/lv0
+  # mount /dev/vg0/lv0 /modencode/browser_data
+  # xfs_growfs /modencode/browser_data
+
+Remount the other volume if you need to, and restart services.
+
+------------------------------------------------------------------------
+
+6. Removing unneeded EBS volumes
+
+If you add capacity to the volume group in small increments as shown
+in the previous section, you may end up with multiple smallish EBS
+volumes RAIDed together and wish to consolidate them into a smaller
+number of large volumes. You can do this by first adding a large
+volume as described in the previous section, and then removing and
+inactivating the smaller ones as shown in the following steps.
+
+Turn off Apache and Mysql:
+
   # /etc/init.d/apache2 stop; /etc/init.d/mysql stop
+
+Unmount the volumes (important!)
+
   # umount /modencode/browser_data
   # umount /modencode/mysql
+
+Move all data off the RAID you are planning to decomission:
+
   # pvmove /dev/md1
+
+Remove this RAID from the volume group:
+
   # vgreduce vg0 /dev/md1
+
+Turn off the RAID:
+
   # mdadm --stop /dev/md1
-  # pvmove /dev/md2
-  # vgreduce vg0 /dev/md2
-  # mdadm --stop /dev/md2
 
-Now edit /etc/mdadm/mdadm.conf to comment out /dev/md1 and
-/dev/md2.
-Don't forget to detach and remove the EBS volumes!
+Now edit /etc/mdadm/mdadm.conf to remove references to /dev/md1.
 
-Extend the logical volume(s) as needed:
-
-  # lvextend -L 1.2T /dev/vg0/lv0
-  Rounding up size to full physical extent 1.20 TiB
-  Extending logical volume lv0 to 1.20 TiB
-  Logical volume lv0 successfully resized
-
-Remount the volumes
-  
-  # mount /dev/vg0/lv0
-  # mount /dev/vg0/lv1
-  # mount /var/lib/mysql
-
-And extend the XFS volume on top of it
- 
-  # xfs_growfs /modencode/browser_data/
-  meta-data=/dev/mapper/vg0-lv0    isize=256    agcount=4,
-  agsize=65470464 blks
-           =                       sectsz=512   attr=2
-  data     =                       bsize=4096   blocks=261881856,
-  imaxpct=25
-           =                       sunit=0      swidth=0 blks
-  naming   =version 2              bsize=4096   ascii-ci=0
-  log      =internal               bsize=4096   blocks=127872, version=2
-           =                       sectsz=512   sunit=0 blks,
-  lazy-count=1
-  realtime =none                   extsz=4096   blocks=0, rtextents=0
-  data blocks changed from 261881856 to 322122752
-
-
-  
-
-
-  
-
+After this, you can use the Amazon console (or euca2ools) to detach
+and destroy the underlying EBS volumes. Make sure you know which ones
+to remove!
 
